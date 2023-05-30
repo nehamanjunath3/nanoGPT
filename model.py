@@ -56,6 +56,17 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            
+        # For Alibi attention
+
+        slopes = [2 ** -i for i in range(1, config.n_head + 1)] # slopes for ALiBi
+
+        # ALiBi biases
+        biases = -torch.arange(config.block_size)[None, :] * torch.tensor(slopes)[:, None] # (n_head, block_size)
+
+        # register as buffer so that it's moved to GPU when model is moved to GPU
+        self.register_buffer("alibi_biases", biases.view(1, config.n_head, config.block_size, 1)) # (1, n_head, block_size, 1)
+    
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -71,17 +82,31 @@ class CausalSelfAttention(nn.Module):
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
+            # manual implementation of alibi attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att + self.alibi_biases[:,:,:T,:T]  # apply ALiBi biases
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y = att @ v 
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+
+        #     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #     att = F.softmax(att, dim=-1)
+        #     att = self.attn_dropout(att)
+        #     y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # # output projection
+        # y = self.resid_dropout(self.c_proj(y))
+        # return y
+    
+    
 
 class MLP(nn.Module):
 
@@ -182,8 +207,9 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb)
+        # x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
